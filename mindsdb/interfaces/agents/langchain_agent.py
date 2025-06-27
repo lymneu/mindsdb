@@ -675,7 +675,10 @@ AI: {response}"""
         input_variables = re.findall(r"{{(.*?)}}", base_template)
         return_context = args.get("return_context", True)
 
-        prompts, _ = prepare_prompts(df, base_template, input_variables, args.get("user_column", USER_COLUMN))
+        if 'template' in args:
+            prompts, _ = prepare_prompts(df, args['template'], input_variables, args.get("user_column", USER_COLUMN))
+        else:
+            prompts, _ = prepare_prompts(df, base_template, input_variables, args.get("user_column", USER_COLUMN))
 
         callbacks, context_callback = prepare_callbacks(self, args)
 
