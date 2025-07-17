@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict, List, Union, Literal
+from typing import Dict, List, Literal, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -17,7 +17,10 @@ from mindsdb.integrations.libs.vectordatabase_handler import (
     VectorStoreHandler,
     DistanceFunction,
     TableField,
+    FilterOperator,
 )
+from mindsdb.integrations.libs.keyword_search_base import KeywordSearchBase
+from mindsdb.integrations.utilities.sql_utils import KeywordSearchArgs
 from mindsdb.utilities import log
 from mindsdb.utilities.profiler import profiler
 from mindsdb.utilities.context import context as ctx
@@ -26,7 +29,7 @@ logger = log.getLogger(__name__)
 
 
 # todo Issue #7316 add support for different indexes and search algorithms e.g. cosine similarity or L2 norm
-class PgVectorHandler(PostgresHandler, VectorStoreHandler):
+class PgVectorHandler(PostgresHandler, VectorStoreHandler, KeywordSearchBase):
     """This handler handles connection and execution of the PostgreSQL with pgvector extension statements."""
 
     name = "pgvector"
@@ -155,15 +158,16 @@ class PgVectorHandler(PostgresHandler, VectorStoreHandler):
         return Response(RESPONSE_TYPE.OK)
 
     @staticmethod
-    def _translate_conditions(conditions: List[FilterCondition]) -> Union[dict, None]:
+    def _translate_conditions(conditions: List[FilterCondition]) -> Tuple[List[dict], dict]:
         """
         Translate filter conditions to a dictionary
         """
 
         if conditions is None:
-            return {}
+            conditions = []
 
-        filter_conditions = {}
+        filter_conditions = []
+        embedding_condition = None
 
         for condition in conditions:
             parts = condition.column.split(".")
@@ -177,12 +181,33 @@ class PgVectorHandler(PostgresHandler, VectorStoreHandler):
                 # last element
                 key += f" ->> '{parts[-1]}'"
 
-            filter_conditions[key] = {
+            type_cast = None
+            value = condition.value
+            if (
+                isinstance(value, list)
+                and len(value) > 0
+                and condition.op in (FilterOperator.IN, FilterOperator.NOT_IN)
+            ):
+                value = condition.value[0]
+
+            if isinstance(value, int):
+                type_cast = "int"
+            elif isinstance(value, float):
+                type_cast = "float"
+            if type_cast is not None:
+                key = f"({key})::{type_cast}"
+
+            item = {
+                "name": key,
                 "op": condition.op.value,
                 "value": condition.value,
             }
+            if key == "embeddings":
+                embedding_condition = item
+            else:
+                filter_conditions.append(item)
 
-        return filter_conditions
+        return filter_conditions, embedding_condition
 
     @staticmethod
     def _construct_where_clause(filter_conditions=None):
@@ -194,16 +219,55 @@ class PgVectorHandler(PostgresHandler, VectorStoreHandler):
 
         where_clauses = []
 
-        for key, value in filter_conditions.items():
-            if key == "embeddings":
-                continue
-            if value["op"].lower() in ("in", "not in"):
-                values = list(repr(i) for i in value["value"])
-                value["value"] = "({})".format(", ".join(values))
-            else:
-                value["value"] = repr(value["value"])
-            where_clauses.append(f"{key} {value['op']} {value['value']}")
+        for item in filter_conditions:
+            key = item["name"]
 
+            if item["op"].lower() in ("in", "not in"):
+                values = list(repr(i) for i in item["value"])
+                item["value"] = "({})".format(", ".join(values))
+            else:
+                if item["value"] is None:
+                    item["value"] = "null"
+                else:
+                    item["value"] = repr(item["value"])
+            where_clauses.append(f"{key} {item['op']} {item['value']}")
+
+        if len(where_clauses) > 1:
+            return f"WHERE {' AND '.join(where_clauses)}"
+        elif len(where_clauses) == 1:
+            return f"WHERE {where_clauses[0]}"
+        else:
+            return ""
+
+    @staticmethod
+    def _construct_where_clause_with_keywords(filter_conditions=None, keyword_query=None, content_column_name=None):
+        if not keyword_query or not content_column_name:
+            return PgVectorHandler._construct_where_clause(filter_conditions)
+
+        # escape single quotes in the keyword query
+        keyword_query = keyword_query.replace("'", "''")  # Escape single quotes in the query
+        keyword_query_condition = (
+            f"""to_tsvector('english', {content_column_name}) @@ websearch_to_tsquery('english', '{keyword_query}')"""
+        )
+        if filter_conditions is None:
+            return ""
+
+        where_clauses = []
+
+        for item in filter_conditions:
+            key = item["name"]
+
+            if item["op"].lower() in ("in", "not in"):
+                values = list(repr(i) for i in item["value"])
+                item["value"] = "({})".format(", ".join(values))
+            else:
+                if item["value"] is None:
+                    item["value"] = "null"
+                else:
+                    item["value"] = repr(item["value"])
+            where_clauses.append(f"{key} {item['op']} {item['value']}")
+
+        where_clauses.append(keyword_query_condition)
         if len(where_clauses) > 1:
             return f"WHERE {' AND '.join(where_clauses)}"
         elif len(where_clauses) == 1:
@@ -218,6 +282,36 @@ class PgVectorHandler(PostgresHandler, VectorStoreHandler):
         limit_clause: str,
     ) -> str:
         return f"{where_clause} {offset_clause} {limit_clause}"
+
+    def _build_keyword_bm25_query(
+        self,
+        table_name: str,
+        query: str,
+        columns: List[str] = None,
+        content_column_name: str = "content",
+        conditions: List[FilterCondition] = None,
+        limit: int = None,
+        offset: int = None,
+    ):
+        if columns is None:
+            columns = ["id", "content", "metadata"]
+
+        filter_conditions, _ = self._translate_conditions(conditions)
+
+        # given filter conditions, construct where clause
+        where_clause = self._construct_where_clause_with_keywords(filter_conditions, query, content_column_name)
+        escaped_query = query.replace("'", r"''")  # Escape single quotes in the query
+        query = f"""
+            SELECT
+                {", ".join(columns)},
+                ts_rank_cd(to_tsvector('english', {content_column_name}), websearch_to_tsquery('english', '{escaped_query}')) as distance
+            FROM
+                {table_name}
+            {where_clause if where_clause else ""}
+            {f"LIMIT {limit}" if limit else ""}
+            {f"OFFSET {offset}" if offset else ""};"""
+
+        return query
 
     def _build_select_query(
         self,
@@ -234,10 +328,7 @@ class PgVectorHandler(PostgresHandler, VectorStoreHandler):
         offset_clause = f"OFFSET {offset}" if offset else ""
 
         # translate filter conditions to dictionary
-        filter_conditions = self._translate_conditions(conditions)
-
-        # check if search vector is in filter conditions
-        embedding_search = filter_conditions.get("embeddings", None)
+        filter_conditions, embedding_search = self._translate_conditions(conditions)
 
         # given filter conditions, construct where clause
         where_clause = self._construct_where_clause(filter_conditions)
@@ -257,36 +348,30 @@ class PgVectorHandler(PostgresHandler, VectorStoreHandler):
 
         targets = ", ".join(modified_columns)
 
-        if filter_conditions:
-            if embedding_search:
-                search_vector = filter_conditions["embeddings"]["value"]
-                filter_conditions.pop("embeddings")
+        if embedding_search:
+            search_vector = embedding_search["value"]
 
-                if self._is_sparse:
-                    # Convert dict to sparse vector if needed
-                    if isinstance(search_vector, dict):
-                        from pgvector.utils import SparseVector
+            if self._is_sparse:
+                # Convert dict to sparse vector if needed
+                if isinstance(search_vector, dict):
+                    from pgvector.utils import SparseVector
 
-                        embedding = SparseVector(search_vector, self._vector_size)
-                        search_vector = embedding.to_text()
-                else:
-                    # Convert list to vector string if needed
-                    if isinstance(search_vector, list):
-                        search_vector = f"[{','.join(str(x) for x in search_vector)}]"
-
-                # Calculate distance as part of the query if needed
-                if has_distance:
-                    targets = f"{targets}, (embeddings {self.distance_op} '{search_vector}') as distance"
-
-                return f"SELECT {targets} FROM {table_name} {where_clause} ORDER BY embeddings {self.distance_op} '{search_vector}' ASC {limit_clause} {offset_clause} "
-
+                    embedding = SparseVector(search_vector, self._vector_size)
+                    search_vector = embedding.to_text()
             else:
-                # if filter conditions, return rows that satisfy the conditions
-                return f"SELECT {targets} FROM {table_name} {where_clause} {limit_clause} {offset_clause}"
+                # Convert list to vector string if needed
+                if isinstance(search_vector, list):
+                    search_vector = f"[{','.join(str(x) for x in search_vector)}]"
+
+            # Calculate distance as part of the query if needed
+            if has_distance:
+                targets = f"{targets}, (embeddings {self.distance_op} '{search_vector}') as distance"
+
+            return f"SELECT {targets} FROM {table_name} {where_clause} ORDER BY embeddings {self.distance_op} '{search_vector}' ASC {limit_clause} {offset_clause} "
 
         else:
-            # if no filter conditions, return all rows
-            return f"SELECT {targets} FROM {table_name} {limit_clause} {offset_clause}"
+            # if filter conditions, return rows that satisfy the conditions
+            return f"SELECT {targets} FROM {table_name} {where_clause} {limit_clause} {offset_clause}"
 
     def _check_table(self, table_name: str):
         # Apply namespace for a user
@@ -312,6 +397,33 @@ class PgVectorHandler(PostgresHandler, VectorStoreHandler):
             columns = ["id", "content", "embeddings", "metadata"]
 
         query = self._build_select_query(table_name, columns, conditions, limit, offset)
+
+        result = self.raw_query(query)
+
+        # ensure embeddings are returned as string so they can be parsed by mindsdb
+        if "embeddings" in columns:
+            result["embeddings"] = result["embeddings"].astype(str)
+
+        return result
+
+    def keyword_select(
+        self,
+        table_name: str,
+        columns: List[str] = None,
+        conditions: List[FilterCondition] = None,
+        offset: int = None,
+        limit: int = None,
+        keyword_search_args: KeywordSearchArgs = None,
+    ) -> pd.DataFrame:
+        table_name = self._check_table(table_name)
+
+        if columns is None:
+            columns = ["id", "content", "embeddings", "metadata"]
+        content_column_name = keyword_search_args.column
+        query = self._build_keyword_bm25_query(
+            table_name, keyword_search_args.query, columns, content_column_name, conditions, limit, offset
+        )
+
         result = self.raw_query(query)
 
         # ensure embeddings are returned as string so they can be parsed by mindsdb
@@ -518,7 +630,7 @@ class PgVectorHandler(PostgresHandler, VectorStoreHandler):
     def delete(self, table_name: str, conditions: List[FilterCondition] = None):
         table_name = self._check_table(table_name)
 
-        filter_conditions = self._translate_conditions(conditions)
+        filter_conditions, _ = self._translate_conditions(conditions)
         where_clause = self._construct_where_clause(filter_conditions)
 
         query = f"DELETE FROM {table_name} {where_clause}"
