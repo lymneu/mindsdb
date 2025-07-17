@@ -102,12 +102,33 @@ class JDBCHandler(DatabaseHandler):
         conn = self.connect()
         try:
             with conn.cursor() as cursor:
+                logger.info(f"Executing native JDBC query: {query}")
                 cursor.execute(query)
                 result = cursor.fetchall()
                 if result:
+                    # 将查询结果转换为Pandas DataFrame
+                    df = pd.DataFrame(result, columns=[desc[0] for desc in cursor.description])
+
+                    # --- START: 新增的自定义CSV保存逻辑 ---
+                    try:
+                        # 定义一个固定的保存路径和文件名
+                        csv_save_path = '/tmp/mindsdb_query_result.csv'
+
+                        # 确保目录存在
+                        # os.makedirs(os.path.dirname(csv_save_path), exist_ok=True)
+
+                        # 将DataFrame保存为CSV文件，不包含索引，使用utf-8-sig以正确处理中文字符
+                        df.to_csv(csv_save_path, index=False, encoding='utf-8-sig')
+
+                        logger.info(f"Custom Save Success: Query result successfully saved to {csv_save_path}")
+                    except Exception as save_e:
+                        # 如果保存失败，只打印错误日志，不中断主流程
+                        logger.error(f"Custom Save-to-CSV failed: {save_e}")
+                    # --- END: 新增的自定义CSV保存逻辑 ---
+
                     response = Response(
                         RESPONSE_TYPE.TABLE,
-                        data_frame=pd.DataFrame(result, columns=[desc[0] for desc in cursor.description])
+                        data_frame=df
                     )
                 else:
                     response = Response(RESPONSE_TYPE.OK)
@@ -117,6 +138,7 @@ class JDBCHandler(DatabaseHandler):
 
         if need_to_close:
             self.disconnect()
+
         return response
 
     def query(self, query: ASTNode) -> Response:
